@@ -153,7 +153,8 @@ jobs:
         shell: bash
         run: |
           set +e
-          kubescape scan framework cis-v1.23-t1.0.1 "$MANIFEST" \
+          kubescape list frameworks
+          kubescape scan framework cis-v1.10.0 "$MANIFEST" \
             --format json \
             --format-version v2 \
             --output reports/kubescape-report.json \
