@@ -140,8 +140,11 @@ jobs:
           exit "$STATUS"
 
       - name: Install Kubescape
+        shell: bash
         run: |
           curl -s https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh | /bin/bash
+          echo "$HOME/.kubescape/bin" >> "$GITHUB_PATH"
+          export PATH="$PATH:$HOME/.kubescape/bin"
           kubescape version
 
       - name: Kubescape CIS Benchmark gate
