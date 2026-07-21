@@ -110,7 +110,7 @@ jobs:
         id: kubescape
         continue-on-error: true
         run: |
-          kubescape scan framework cis-v1.23-t1.0.1 kubernetes \
+          kubescape scan framework cis-v1.10.0 kubernetes \
             --format json \
             --format-version v2 \
             --output reports/kubescape-report.json \
