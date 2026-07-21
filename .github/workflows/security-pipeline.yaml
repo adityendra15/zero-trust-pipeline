@@ -1,0 +1,330 @@
+name: Zero-Trust Security-Gated Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      demo_failure:
+        description: "Choose policy to intentionally demonstrate a blocked release"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none
+          - policy
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  security-gated-promotion:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run application tests
+        run: pytest -q
+
+      - name: Select secure or intentionally insecure manifest
+        shell: bash
+        run: |
+          if [[ "${{ github.event.inputs.demo_failure || 'none' }}" == "policy" ]]; then
+            echo "MANIFEST=kubernetes/insecure-deployment.yaml" >> "$GITHUB_ENV"
+          else
+            echo "MANIFEST=kubernetes/deployment.yaml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Calculate candidate and approved image names
+        shell: bash
+        run: |
+          REPOSITORY_LOWERCASE="${GITHUB_REPOSITORY,,}"
+          BASE_IMAGE="${REGISTRY}/${REPOSITORY_LOWERCASE}"
+          echo "BASE_IMAGE=${BASE_IMAGE}" >> "$GITHUB_ENV"
+          echo "CANDIDATE_IMAGE=${BASE_IMAGE}:candidate-${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "APPROVED_IMAGE=${BASE_IMAGE}:approved-${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Build candidate image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "$CANDIDATE_IMAGE" .
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push candidate image
+        run: docker push "$CANDIDATE_IMAGE"
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Trivy CVE gate
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.CANDIDATE_IMAGE }}
+          format: json
+          output: reports/trivy-report.json
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL"
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.CANDIDATE_IMAGE }}
+          format: cyclonedx
+          output: reports/sbom.cdx.json
+          exit-code: "0"
+
+      - name: Install Snyk CLI
+        run: npm install --global snyk
+
+      - name: Snyk software-composition-analysis gate
+        id: snyk
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        shell: bash
+        run: |
+          set +e
+          snyk test \
+            --file=requirements.txt \
+            --package-manager=pip \
+            --severity-threshold=high \
+            --json-file-output=reports/snyk-report.json
+          STATUS=$?
+          set -e
+          if [ ! -f reports/snyk-report.json ]; then
+            printf '{"error":"Snyk did not create a report; verify SNYK_TOKEN"}\n' > reports/snyk-report.json
+          fi
+          exit "$STATUS"
+
+      - name: OPA/Rego policy-as-code gate with Conftest
+        id: conftest
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project \
+            openpolicyagent/conftest:v0.68.2 \
+            test "$MANIFEST" --policy policy --output json \
+            > reports/conftest-report.json
+          STATUS=$?
+          set -e
+          exit "$STATUS"
+
+      - name: Install Kubescape
+        run: |
+          curl -s https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh | /bin/bash
+          kubescape version
+
+      - name: Kubescape CIS Benchmark gate
+        id: kubescape
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          kubescape scan framework cis-v1.23-t1.0.1 "$MANIFEST" \
+            --format json \
+            --format-version v2 \
+            --output reports/kubescape-report.json \
+            --compliance-threshold 50
+          STATUS=$?
+          set -e
+          if [ ! -f reports/kubescape-report.json ]; then
+            printf '{"error":"Kubescape did not create a report"}\n' > reports/kubescape-report.json
+          fi
+          exit "$STATUS"
+
+      - name: Install Kind
+        run: |
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Create policy-test Kubernetes cluster
+        run: kind create cluster --name zero-trust --config kind-config.yaml
+
+      - name: Install OPA Gatekeeper admission controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/v3.22.2/deploy/gatekeeper.yaml
+          kubectl wait --for=condition=available deployment/gatekeeper-controller-manager \
+            -n gatekeeper-system --timeout=180s
+
+      - name: Install admission policy
+        run: |
+          kubectl apply -f gatekeeper/constraint-template.yaml
+          kubectl wait --for=condition=Established \
+            crd/k8srequirednonroot.constraints.gatekeeper.sh --timeout=120s
+          kubectl apply -f gatekeeper/constraint.yaml
+          sleep 10
+
+      - name: OPA/Rego admission-policy gate
+        id: admission
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed \
+            -e "s|IMAGE_PLACEHOLDER|$CANDIDATE_IMAGE|g" \
+            -e "s|VERSION_PLACEHOLDER|candidate-$GITHUB_SHA|g" \
+            "$MANIFEST" > rendered-candidate.yaml
+
+          kind load docker-image "$CANDIDATE_IMAGE" --name zero-trust
+
+          set +e
+          kubectl apply -f rendered-candidate.yaml > /tmp/application-admission.txt 2>&1
+          APPLICATION_STATUS=$?
+          BAD_OUTPUT="$(kubectl apply -f gatekeeper/bad-pod.yaml 2>&1)"
+          BAD_STATUS=$?
+          set -e
+
+          python - "$APPLICATION_STATUS" "$BAD_STATUS" "$BAD_OUTPUT" <<'PY'
+          import json
+          import sys
+
+          application_status = int(sys.argv[1])
+          bad_status = int(sys.argv[2])
+          bad_output = sys.argv[3]
+
+          report = {
+              "candidate_manifest_accepted": application_status == 0,
+              "intentionally_insecure_pod_rejected": bad_status != 0,
+              "insecure_pod_output": bad_output,
+          }
+          with open("reports/gatekeeper-admission-report.json", "w", encoding="utf-8") as handle:
+              json.dump(report, handle, indent=2)
+
+          if application_status != 0:
+              raise SystemExit("Candidate manifest was rejected by admission policy")
+          if bad_status == 0:
+              raise SystemExit("Gatekeeper failed to reject the intentionally insecure pod")
+          PY
+
+      - name: Write gate summary
+        if: always()
+        env:
+          TRIVY: ${{ steps.trivy.outcome }}
+          SNYK: ${{ steps.snyk.outcome }}
+          CONFTEST: ${{ steps.conftest.outcome }}
+          KUBESCAPE: ${{ steps.kubescape.outcome }}
+          ADMISSION: ${{ steps.admission.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          outcomes = {
+              "trivy": os.environ["TRIVY"],
+              "snyk": os.environ["SNYK"],
+              "conftest": os.environ["CONFTEST"],
+              "kubescape": os.environ["KUBESCAPE"],
+              "gatekeeper_admission": os.environ["ADMISSION"],
+          }
+          with open("reports/gate-summary.json", "w", encoding="utf-8") as handle:
+              json.dump(outcomes, handle, indent=2)
+          print(json.dumps(outcomes, indent=2))
+          PY
+
+      - name: Evaluate all blocking security gates
+        shell: bash
+        env:
+          TRIVY: ${{ steps.trivy.outcome }}
+          SNYK: ${{ steps.snyk.outcome }}
+          CONFTEST: ${{ steps.conftest.outcome }}
+          KUBESCAPE: ${{ steps.kubescape.outcome }}
+          ADMISSION: ${{ steps.admission.outcome }}
+        run: |
+          FAILED=0
+          for OUTCOME in "$TRIVY" "$SNYK" "$CONFTEST" "$KUBESCAPE" "$ADMISSION"; do
+            if [ "$OUTCOME" != "success" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "At least one mandatory security gate failed. Image promotion is blocked."
+            exit 1
+          fi
+
+          echo "Every mandatory security gate passed."
+
+      - name: Promote candidate image to approved
+        run: |
+          docker tag "$CANDIDATE_IMAGE" "$APPROVED_IMAGE"
+          docker push "$APPROVED_IMAGE"
+
+      - name: Deploy only the approved image
+        run: |
+          kind load docker-image "$APPROVED_IMAGE" --name zero-trust
+          sed \
+            -e "s|IMAGE_PLACEHOLDER|$APPROVED_IMAGE|g" \
+            -e "s|VERSION_PLACEHOLDER|approved-$GITHUB_SHA|g" \
+            kubernetes/deployment.yaml > rendered-approved.yaml
+          kubectl apply -f rendered-approved.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl rollout status deployment/zero-trust-pipeline --timeout=120s
+
+      - name: Upload structured security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: structured-security-reports
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Open remediation GitHub Issue after a failed gate
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `Security gates blocked promotion — run ${context.runId}`;
+            const body = [
+              "## Automated remediation ticket",
+              "",
+              `The Zero-Trust pipeline blocked image promotion for commit \`${context.sha}\`.`,
+              "",
+              "At least one mandatory gate failed:",
+              "- Trivy CVE scan",
+              "- Snyk software-composition analysis",
+              "- Conftest OPA/Rego policy",
+              "- Kubescape CIS Benchmark check",
+              "- Gatekeeper admission-policy verification",
+              "",
+              `Review the workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Download the **structured-security-reports** artifact for JSON evidence and remediation details."
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body
+            });
