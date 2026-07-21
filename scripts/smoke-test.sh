@@ -8,6 +8,7 @@ kubectl run smoke-test \
   --rm \
   --attach \
   --quiet \
+  --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":10001,"runAsGroup":10001,"seccompProfile":{"type":"RuntimeDefault"}}}}' \
   --command -- \
   sh -c 'curl --fail --silent http://zero-trust-pipeline-app/health/ready'
 
