@@ -7,9 +7,9 @@ app = Flask(__name__)
 @app.get("/")
 def home():
     return jsonify(
-        application="zero-trust-pipeline",
-        message="Only security-approved images are deployed",
-        version=os.getenv("APP_VERSION", "local"),
+        message="Zero-Trust pipeline application is running",
+        version=os.getenv("APP_VERSION", "development"),
+        pod=os.getenv("HOSTNAME", "local"),
     )
 
 

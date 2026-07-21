@@ -1,75 +1,46 @@
 # Zero-Trust CI/CD Pipeline with Policy-as-Code Gates
 
-This intentionally small repository implements the resume claims:
+A learning project that demonstrates verification before approval. Every container image begins as an untrusted `candidate-<commit-sha>` artifact. It is promoted to `approved-<commit-sha>` and deployed only after all mandatory security gates pass.
 
-- A candidate container image is built and pushed as `candidate-<commit>`.
-- Trivy performs a blocking CVE scan and writes JSON.
-- Snyk performs blocking software-composition analysis and writes JSON.
-- Conftest evaluates Kubernetes YAML with OPA/Rego and writes JSON.
-- Kubescape runs a blocking CIS Benchmark check and writes JSON.
-- OPA Gatekeeper acts as a real Kubernetes admission controller.
-- Reports and the SBOM are uploaded as a GitHub Actions artifact.
-- A failed mandatory gate blocks promotion and opens a GitHub Issue.
-- Only a fully passing candidate is retagged as `approved-<commit>`.
-- Kubernetes deploys only the approved image.
+## Mandatory gates
 
-## Zero Trust and least privilege
+1. **Trivy** scans the candidate container image for fixable HIGH and CRITICAL CVEs.
+2. **Snyk** performs software-composition analysis of Python dependencies at the HIGH severity threshold.
+3. **Conftest with OPA/Rego** enforces custom Kubernetes policy-as-code rules.
+4. **Kubescape** performs a CIS-oriented Kubernetes manifest scan with a compliance threshold.
+5. **OPA Gatekeeper** runs inside a temporary Kind cluster and must reject a deliberately insecure Pod.
 
-- Every candidate is verified before trust is granted.
-- Gates fail closed.
-- Gatekeeper rejects Pods that do not require non-root execution.
-- The container uses UID 10001, a read-only root filesystem, dropped capabilities and no privilege escalation.
-- The Pod does not automatically receive a service-account token.
-- Images use immutable commit-based tags rather than `latest`.
-- GitHub Actions receives only read-content, write-package and write-issue permissions.
-
-## Required GitHub secret
-
-Create a free Snyk account and add a repository secret named:
+## Delivery flow
 
 ```text
-SNYK_TOKEN
+push to main
+  -> tests
+  -> build and publish candidate image
+  -> Trivy + Snyk + Conftest + Kubescape gates
+  -> upload structured reports
+  -> all gates pass?
+       no: open remediation issue; no approval or deployment
+       yes: promote to approved image
+  -> create temporary Kind cluster
+  -> install Gatekeeper
+  -> prove insecure workload is denied
+  -> deploy only the approved image
+  -> validate application health
 ```
 
-Never commit the token to a file.
+## Image tags
 
-## Passing demonstration
+- `candidate-<full-git-sha>` means built but not yet trusted.
+- `approved-<full-git-sha>` means the same image passed every mandatory gate.
 
-Run the workflow manually with `demo_failure = none`.
+## Reports
 
-Expected result: all gates pass, an `approved-<commit>` image appears in GHCR, and Kubernetes deploys it.
+The workflow uploads JSON reports from Trivy, Snyk, Conftest, and Kubescape. It also saves Gatekeeper denial evidence.
 
-## Failing demonstration
+## Important scope limitation
 
-Run the workflow manually with `demo_failure = policy`.
+This is a demonstration project. It uses a temporary Kind cluster inside GitHub Actions, a small Flask application, selected policies, and chosen thresholds. It is not a complete production Zero-Trust platform or a permanent cloud deployment.
 
-The intentionally insecure manifest uses `latest`, lacks non-root enforcement, permits privilege escalation and lacks limits.
+## Required repository secret
 
-Expected evidence:
-
-- Conftest and Kubescape fail.
-- JSON reports remain downloadable.
-- An automated GitHub Issue opens.
-- No approved image is created.
-- No approved image is deployed.
-
-## Local policy demonstration
-
-```bash
-./scripts/run-policy-demo.sh
-```
-
-The secure manifest passes and the insecure manifest is blocked.
-
-## Image promotion
-
-```text
-candidate-<commit>
-      |
-      | all mandatory gates pass
-      v
-approved-<commit>
-      |
-      v
-Kubernetes deployment
-```
+Create a GitHub Actions repository secret named `SNYK_TOKEN`. The workflow intentionally fails closed when this secret is missing.

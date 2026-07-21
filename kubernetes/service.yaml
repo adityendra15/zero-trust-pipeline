@@ -1,12 +1,14 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: zero-trust-pipeline
+  name: zero-trust-pipeline-app
+  namespace: zero-trust-pipeline
+  labels:
+    app: zero-trust-pipeline-app
 spec:
   selector:
-    app: zero-trust-pipeline
+    app: zero-trust-pipeline-app
   ports:
     - name: http
       port: 80
-      targetPort: http
-  type: ClusterIP
+      targetPort: 8080

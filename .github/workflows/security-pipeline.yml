@@ -1,0 +1,258 @@
+name: Zero-Trust CI/CD Pipeline with Policy-as-Code Gates
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+  KIND_VERSION: v0.31.0
+  GATEKEEPER_VERSION: v3.23.0
+
+jobs:
+  security-gated-delivery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      - name: Run application tests
+        run: python -m pytest -v
+
+      - name: Define candidate and approved image names
+        id: image
+        shell: bash
+        run: |
+          IMAGE_BASE=$(echo "${REGISTRY}/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "candidate=${IMAGE_BASE}:candidate-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "approved=${IMAGE_BASE}:approved-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build untrusted candidate image
+        run: docker build --tag "${{ steps.image.outputs.candidate }}" .
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push candidate image before approval
+        run: docker push "${{ steps.image.outputs.candidate }}"
+
+      - name: Prepare report directory
+        run: mkdir -p reports
+
+      - name: Trivy CVE gate
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.candidate }}
+          format: json
+          output: reports/trivy-report.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk software-composition gate
+        id: snyk
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "${SNYK_TOKEN}" ]; then
+            printf '{"error":"SNYK_TOKEN repository secret is missing"}\n' > reports/snyk-report.json
+            exit 1
+          fi
+          snyk test --severity-threshold=high --json-file-output=reports/snyk-report.json
+
+      - name: OPA/Rego policy-as-code gate
+        id: conftest
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/project" \
+            -w /project \
+            openpolicyagent/conftest:v0.62.0 \
+            test kubernetes/deployment.yaml \
+            --policy policy \
+            --output json \
+            > reports/conftest-report.json
+
+      - name: Install Kubescape CLI
+        run: |
+          curl -s https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh | /bin/bash
+          echo "$HOME/.kubescape/bin" >> "$GITHUB_PATH"
+
+      - name: Kubescape CIS benchmark gate
+        id: kubescape
+        continue-on-error: true
+        run: |
+          kubescape scan framework cis-v1.23-t1.0.1 kubernetes \
+            --format json \
+            --format-version v2 \
+            --output reports/kubescape-report.json \
+            --compliance-threshold 50
+
+      - name: Upload structured security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-gate-reports-${{ github.sha }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce all mandatory security gates
+        id: enforce
+        shell: bash
+        run: |
+          echo "Trivy:     ${{ steps.trivy.outcome }}"
+          echo "Snyk:      ${{ steps.snyk.outcome }}"
+          echo "Conftest:  ${{ steps.conftest.outcome }}"
+          echo "Kubescape: ${{ steps.kubescape.outcome }}"
+
+          failed=0
+          for outcome in \
+            "${{ steps.trivy.outcome }}" \
+            "${{ steps.snyk.outcome }}" \
+            "${{ steps.conftest.outcome }}" \
+            "${{ steps.kubescape.outcome }}"
+          do
+            if [ "$outcome" != "success" ]; then
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "At least one mandatory gate failed. Candidate image will not be promoted or deployed."
+            exit 1
+          fi
+
+          echo "All mandatory gates passed. Image is eligible for promotion."
+
+      - name: Promote candidate to approved image
+        run: |
+          docker tag "${{ steps.image.outputs.candidate }}" "${{ steps.image.outputs.approved }}"
+          docker push "${{ steps.image.outputs.approved }}"
+
+      - name: Install Kind
+        run: |
+          curl -Lo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+
+      - name: Create temporary Kubernetes cluster
+        run: kind create cluster --name zero-trust-pipeline --config kind-config.yaml --wait 120s
+
+      - name: Load approved image into Kind
+        run: kind load docker-image "${{ steps.image.outputs.approved }}" --name zero-trust-pipeline
+
+      - name: Create application namespace
+        run: kubectl apply -f kubernetes/namespace.yaml
+
+      - name: Install OPA Gatekeeper admission controller
+        run: |
+          kubectl apply -f "https://raw.githubusercontent.com/open-policy-agent/gatekeeper/${GATEKEEPER_VERSION}/deploy/gatekeeper.yaml"
+          kubectl wait --namespace gatekeeper-system \
+            --for=condition=Available deployment/gatekeeper-controller-manager \
+            --timeout=240s
+          kubectl wait --namespace gatekeeper-system \
+            --for=condition=Available deployment/gatekeeper-audit \
+            --timeout=240s
+
+      - name: Install Gatekeeper policy
+        run: |
+          kubectl apply -f gatekeeper/constraint-template.yaml
+          kubectl wait --for=condition=Established \
+            crd/k8srequiredsecuritycontrols.constraints.gatekeeper.sh \
+            --timeout=120s
+          kubectl apply -f gatekeeper/constraint.yaml
+          sleep 10
+
+      - name: Prove Gatekeeper rejects an insecure workload
+        run: bash scripts/verify-gatekeeper.sh
+
+      - name: Render approved Kubernetes Deployment
+        env:
+          APPROVED_IMAGE: ${{ steps.image.outputs.approved }}
+          APPROVED_VERSION: ${{ steps.image.outputs.version }}
+        run: bash scripts/render-manifest.sh
+
+      - name: Deploy only the approved image
+        run: |
+          kubectl apply -f kubernetes/service.yaml
+          kubectl apply -f rendered-deployment.yaml
+          kubectl rollout status deployment/zero-trust-pipeline-app \
+            --namespace zero-trust-pipeline \
+            --timeout=180s
+
+      - name: Validate approved application
+        run: bash scripts/smoke-test.sh
+
+      - name: Upload Gatekeeper evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatekeeper-evidence-${{ github.sha }}
+          path: reports/gatekeeper-evidence.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Open remediation issue when pipeline fails
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The Zero-Trust pipeline failed for commit \`${context.sha}\`.`,
+              "",
+              `Candidate image: \`${{ steps.image.outputs.candidate }}\``,
+              "",
+              "Gate outcomes:",
+              `- Trivy: \`${{ steps.trivy.outcome }}\``,
+              `- Snyk: \`${{ steps.snyk.outcome }}\``,
+              `- Conftest/OPA: \`${{ steps.conftest.outcome }}\``,
+              `- Kubescape CIS: \`${{ steps.kubescape.outcome }}\``,
+              "",
+              `Workflow logs: ${runUrl}`,
+              "",
+              "Review the uploaded security reports, remediate the failure, and run the pipeline again. The candidate was not promoted to an approved image unless all mandatory gates passed."
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security gate remediation required — ${context.sha.substring(0, 7)}`,
+              body,
+              labels: []
+            });
+
+      - name: Show final Kubernetes state
+        if: always()
+        run: |
+          kubectl get all --all-namespaces || true
+          kubectl get constraints || true
