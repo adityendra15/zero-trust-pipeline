@@ -153,7 +153,8 @@ jobs:
           curl --fail --silent --show-error \
             https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh \
             | /bin/bash
-          kubescape version
+          echo "$HOME/.kubescape/bin" >> "$GITHUB_PATH"
+          "$HOME/.kubescape/bin/kubescape" version
 
       - name: Gate 4 - Kubescape CIS Benchmark check
         id: kubescape
