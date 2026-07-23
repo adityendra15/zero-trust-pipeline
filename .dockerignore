@@ -1,8 +1,10 @@
 .git
 .github
-.venv
 __pycache__
-.pytest_cache
 *.pyc
 reports
 README.md
+CLAIM_MAP.md
+demo
+policy
+k8s

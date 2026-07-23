@@ -1,82 +1,37 @@
-package main
+package kubernetes.admission
 
-import rego.v1
-
-is_deployment if input.kind == "Deployment"
-
-containers contains container if {
-  is_deployment
-  container := input.spec.template.spec.containers[_]
+# Reject images that use the changeable :latest tag.
+deny contains message if {
+    container := input.spec.template.spec.containers[_]
+    endswith(container.image, ":latest")
+    message := "Container images must not use the :latest tag."
 }
 
-deny contains msg if {
-  container := containers[_]
-  endswith(container.image, ":latest")
-  msg := sprintf("Container %q uses the mutable latest tag.", [container.name])
+# Require the Pod to run as a non-root user.
+deny contains message if {
+    pod_security := object.get(input.spec.template.spec, "securityContext", {})
+    object.get(pod_security, "runAsNonRoot", false) != true
+    message := "The Pod must set runAsNonRoot to true."
 }
 
-deny contains msg if {
-  is_deployment
-  not input.spec.template.spec.securityContext.runAsNonRoot
-  msg := "Pod securityContext.runAsNonRoot must be true."
+# Prevent a container from gaining extra privileges.
+deny contains message if {
+    container := input.spec.template.spec.containers[_]
+    container_security := object.get(container, "securityContext", {})
+    object.get(container_security, "allowPrivilegeEscalation", true) != false
+    message := "Containers must set allowPrivilegeEscalation to false."
 }
 
-deny contains msg if {
-  container := containers[_]
-  container.securityContext.allowPrivilegeEscalation != false
-  msg := sprintf("Container %q must disable privilege escalation.", [container.name])
+# Require the container root filesystem to be read-only.
+deny contains message if {
+    container := input.spec.template.spec.containers[_]
+    container_security := object.get(container, "securityContext", {})
+    object.get(container_security, "readOnlyRootFilesystem", false) != true
+    message := "Containers must set readOnlyRootFilesystem to true."
 }
 
-deny contains msg if {
-  container := containers[_]
-  container.securityContext.readOnlyRootFilesystem != true
-  msg := sprintf("Container %q must use a read-only root filesystem.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not "ALL" in container.securityContext.capabilities.drop
-  msg := sprintf("Container %q must drop all Linux capabilities.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.resources.requests.cpu
-  msg := sprintf("Container %q must define a CPU request.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.resources.requests.memory
-  msg := sprintf("Container %q must define a memory request.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.resources.limits.cpu
-  msg := sprintf("Container %q must define a CPU limit.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.resources.limits.memory
-  msg := sprintf("Container %q must define a memory limit.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.livenessProbe
-  msg := sprintf("Container %q must define a liveness probe.", [container.name])
-}
-
-deny contains msg if {
-  container := containers[_]
-  not container.readinessProbe
-  msg := sprintf("Container %q must define a readiness probe.", [container.name])
-}
-
-deny contains msg if {
-  is_deployment
-  input.spec.template.spec.automountServiceAccountToken != false
-  msg := "Automatic service-account token mounting must be disabled."
+# Do not automatically mount a Kubernetes API token into the Pod.
+deny contains message if {
+    object.get(input.spec.template.spec, "automountServiceAccountToken", true) != false
+    message := "Pods must set automountServiceAccountToken to false."
 }

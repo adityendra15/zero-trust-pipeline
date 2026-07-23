@@ -1,0 +1,280 @@
+name: Zero-Trust Security-Gated Pipeline
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      demonstrate_failure:
+        description: Use the intentionally insecure manifest to demonstrate blocking and issue creation
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+jobs:
+  build-scan-and-promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository code
+        uses: actions/checkout@v4
+
+      - name: Select the Kubernetes manifest to inspect
+        id: manifest
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.demonstrate_failure }}" = "true" ]; then
+            echo "path=demo/insecure-deployment.yaml" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=k8s/deployment.yaml" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create image names and report folder
+        id: image
+        shell: bash
+        run: |
+          IMAGE_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE_WITH_TAG="${IMAGE_REPOSITORY}:${GITHUB_SHA}"
+          echo "full_name=${IMAGE_WITH_TAG}" >> "$GITHUB_OUTPUT"
+          mkdir -p reports
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Test the Python application
+        shell: bash
+        run: |
+          python app.py > /tmp/zero-trust-app.log 2>&1 &
+          APP_PID=$!
+
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8080/healthz; then
+              kill "$APP_PID"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          cat /tmp/zero-trust-app.log
+          kill "$APP_PID" || true
+          exit 1
+
+      - name: Build the candidate Docker image
+        shell: bash
+        run: |
+          docker build \
+            --tag "${{ steps.image.outputs.full_name }}" \
+            --tag zero-trust-app:candidate \
+            .
+
+      - name: Gate 1 - Trivy critical CVE scan
+        id: trivy
+        continue-on-error: true
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$PWD:/workspace" \
+            aquasec/trivy:0.72.0 image \
+            --format json \
+            --output /workspace/reports/trivy.json \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            "${{ steps.image.outputs.full_name }}"
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@v1.0.0
+
+      - name: Gate 2 - Snyk software-composition analysis
+        id: snyk
+        continue-on-error: true
+        shell: bash
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          set +e
+
+          if [ -z "$SNYK_TOKEN" ]; then
+            printf '%s\n' \
+              '{"gate":"snyk","status":"error","message":"SNYK_TOKEN is missing"}' \
+              > reports/snyk.json
+            exit 1
+          fi
+
+          snyk test \
+            --file=requirements.txt \
+            --package-manager=pip \
+            --severity-threshold=high \
+            --json-file-output=reports/snyk.json
+          SNYK_STATUS=$?
+
+          if [ ! -s reports/snyk.json ]; then
+            printf '%s\n' \
+              '{"gate":"snyk","status":"error","message":"Snyk did not create a report"}' \
+              > reports/snyk.json
+          fi
+
+          exit "$SNYK_STATUS"
+
+      - name: Gate 3 - OPA/Rego policy evaluation
+        id: opa
+        continue-on-error: true
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace" \
+            openpolicyagent/opa:1.17.0-static \
+            eval \
+            --format json \
+            --data /workspace/policy/deployment.rego \
+            --input "/workspace/${{ steps.manifest.outputs.path }}" \
+            data.kubernetes.admission.deny \
+            > reports/opa.json
+
+          jq --exit-status \
+            '.result[0].expressions[0].value | length == 0' \
+            reports/opa.json
+
+      - name: Install Kubescape CLI
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh \
+            | /bin/bash
+          kubescape version
+
+      - name: Gate 4 - Kubescape CIS Benchmark check
+        id: kubescape
+        continue-on-error: true
+        shell: bash
+        run: |
+          kubescape scan control C-0210 \
+            "${{ steps.manifest.outputs.path }}" \
+            --format json \
+            --format-version v2 \
+            --output reports/kubescape.json \
+            --compliance-threshold 100
+
+      - name: Create the structured gate summary
+        if: always()
+        shell: bash
+        run: |
+          TRIVY_RESULT="${{ steps.trivy.outcome }}"
+          SNYK_RESULT="${{ steps.snyk.outcome }}"
+          OPA_RESULT="${{ steps.opa.outcome }}"
+          KUBESCAPE_RESULT="${{ steps.kubescape.outcome }}"
+
+          if [ "$TRIVY_RESULT" = "success" ] && \
+             [ "$SNYK_RESULT" = "success" ] && \
+             [ "$OPA_RESULT" = "success" ] && \
+             [ "$KUBESCAPE_RESULT" = "success" ]; then
+            PROMOTION_ALLOWED=true
+          else
+            PROMOTION_ALLOWED=false
+          fi
+
+          jq --null-input \
+            --arg trivy "$TRIVY_RESULT" \
+            --arg snyk "$SNYK_RESULT" \
+            --arg opa "$OPA_RESULT" \
+            --arg kubescape "$KUBESCAPE_RESULT" \
+            --arg manifest "${{ steps.manifest.outputs.path }}" \
+            --argjson promotion_allowed "$PROMOTION_ALLOWED" \
+            '{
+              manifest: $manifest,
+              gates: {
+                trivy: $trivy,
+                snyk: $snyk,
+                opa: $opa,
+                kubescape: $kubescape
+              },
+              promotion_allowed: $promotion_allowed
+            }' > reports/gate-summary.json
+
+          cat reports/gate-summary.json
+
+      - name: Save all JSON reports as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: reports/*.json
+          if-no-files-found: warn
+
+      - name: Open a GitHub Issue when a security gate fails
+        if: >-
+          always() &&
+          (steps.trivy.outcome == 'failure' ||
+           steps.snyk.outcome == 'failure' ||
+           steps.opa.outcome == 'failure' ||
+           steps.kubescape.outcome == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              trivy: "${{ steps.trivy.outcome }}",
+              snyk: "${{ steps.snyk.outcome }}",
+              opa: "${{ steps.opa.outcome }}",
+              kubescape: "${{ steps.kubescape.outcome }}"
+            };
+
+            const failed = Object.entries(results)
+              .filter(([, result]) => result === "failure")
+              .map(([gate]) => `- ${gate}`)
+              .join("\n");
+
+            const body = [
+              "The Zero-Trust pipeline blocked image promotion.",
+              "",
+              "Failed gates:",
+              failed,
+              "",
+              `Manifest checked: \`${{ steps.manifest.outputs.path }}\``,
+              `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Download the security-reports artifact from the workflow run and inspect the JSON reports before making a change."
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security gates failed in workflow run #${context.runNumber}`,
+              body
+            });
+
+      - name: Block image promotion if any gate failed
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.trivy.outcome }}" != "success" ] || \
+             [ "${{ steps.snyk.outcome }}" != "success" ] || \
+             [ "${{ steps.opa.outcome }}" != "success" ] || \
+             [ "${{ steps.kubescape.outcome }}" != "success" ]; then
+            echo "At least one security gate failed. The image will not be promoted."
+            exit 1
+          fi
+
+          echo "All security gates passed. Image promotion is allowed."
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote the approved image
+        shell: bash
+        run: docker push "${{ steps.image.outputs.full_name }}"

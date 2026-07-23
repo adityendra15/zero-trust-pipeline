@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: deliberately-insecure-example
-  namespace: zero-trust-pipeline
+  name: zero-trust-app-insecure-demo
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: deliberately-insecure-example
+      app: zero-trust-app-insecure-demo
   template:
     metadata:
       labels:
-        app: deliberately-insecure-example
+        app: zero-trust-app-insecure-demo
     spec:
       containers:
-        - name: insecure
-          image: nginx:latest
+        - name: application
+          image: zero-trust-app:latest
           securityContext:
             allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false

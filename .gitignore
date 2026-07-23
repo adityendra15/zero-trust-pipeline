@@ -1,8 +1,5 @@
-.venv/
-__pycache__/
-.pytest_cache/
-*.pyc
 .DS_Store
-reports/*
-!reports/.gitkeep
-rendered-deployment.yaml
+__pycache__/
+*.pyc
+.venv/
+reports/

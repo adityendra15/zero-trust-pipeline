@@ -1,26 +1,20 @@
-import os
-from flask import Flask, jsonify
+"""A tiny web application used by the Zero-Trust pipeline project."""
+
+from flask import Flask
 
 app = Flask(__name__)
 
 
 @app.get("/")
-def home():
-    return jsonify(
-        message="Zero-Trust pipeline application is running",
-        version=os.getenv("APP_VERSION", "development"),
-        pod=os.getenv("HOSTNAME", "local"),
-    )
+def home() -> str:
+    """Return a simple message for the home page."""
+    return "Zero-Trust Pipeline Application is Running\n"
 
 
-@app.get("/health/live")
-def liveness():
-    return jsonify(status="alive"), 200
-
-
-@app.get("/health/ready")
-def readiness():
-    return jsonify(status="ready"), 200
+@app.get("/healthz")
+def health() -> str:
+    """Return a successful response for health checks."""
+    return "OK\n"
 
 
 if __name__ == "__main__":
